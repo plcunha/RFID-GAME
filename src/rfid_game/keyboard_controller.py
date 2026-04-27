@@ -34,6 +34,13 @@ class KeyboardController:
                 time.sleep(duration)
                 self.controller.release(key)
                 logger.debug(f"Held key: {key} for {duration}s")
+            else:
+                special_key = getattr(Key, key.lower(), None)
+                if special_key:
+                    self.controller.press(special_key)
+                    time.sleep(duration)
+                    self.controller.release(special_key)
+                    logger.debug(f"Held special key: {key} for {duration}s")
         except Exception as e:
             logger.error(f"Failed to hold key '{key}': {e}")
 
