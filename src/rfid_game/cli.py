@@ -184,9 +184,10 @@ class RFIDGameCLI:
     def _connect_reader(self) -> bool:
         reader_ip = self.config.get("reader_ip", "192.168.89.25")
         print(f"\nConectando ao leitor em {reader_ip}...")
-        self.scanner = RFIDReader(reader_ip, tx_power_dbm=self.tx_power_dbm)
+        self.scanner = RFIDReader(reader_ip)
         if self.scanner.connect():
             self.scanner.set_callback(self.on_tag_detected)
+            self.scanner.start()
             print("Conectado com sucesso!")
             return True
         else:
@@ -258,57 +259,37 @@ class RFIDGameCLI:
 
     def scan_tags(self):
         if not self.scanner or not self.scanner.connected:
-            print("\nLeitor nao conectado.")
-            input("Pressione ENTER para voltar...")
-            return
+            if not self.connect_reader():
+                input("\nPressione ENTER para voltar...")
+                return
 
         self.clear_screen()
         self.print_header("ESCANEAR TAGS")
-        print("\nLendo tags por 10 segundos...")
-        print("As tags aparecerao apos este menu.")
-        print("Pressione Ctrl+C para parar.\n")
+        print("\nLendo tags... Pressione Ctrl+C para parar.\n")
+        print(f"{'EPC':<26} {'RSSI':<8} {'Antena':<8} {'Vezes':<8}")
+        print("-" * 60)
 
-        # Record tags before scan to show only new ones
-        tags_before = set(tag["epc"] for tag in self.tag_store.get_all_tags())
-
+        last_count = 0
         try:
-            time.sleep(10)
+            while True:
+                tags = self.tag_store.get_all_tags()
+                if len(tags) != last_count:
+                    self.clear_screen()
+                    self.print_header("ESCANEAR TAGS")
+                    print("\nLendo tags... Pressione Ctrl+C para parar.\n")
+                    print(f"{'EPC':<26} {'RSSI':<8} {'Antena':<8} {'Vezes':<8}")
+                    print("-" * 60)
+                    for tag in tags:
+                        epc_display = decode_epc(tag["epc"])[:24]
+                        antennas = ",".join(str(a) for a in tag["antennas"])
+                        print(
+                            f"{epc_display:<26} {tag['avg_rssi']:<8} {antennas:<8} {tag['count']:<8}"
+                        )
+                    print(f"\nTotal: {len(tags)} tag(s) unica(s)")
+                    last_count = len(tags)
+                time.sleep(0.5)
         except KeyboardInterrupt:
             pass
-
-        self.clear_screen()
-        self.print_header("TAGS DETECTADAS")
-        tags = self.tag_store.get_all_tags()
-        new_tags = [t for t in tags if t["epc"] not in tags_before]
-
-        if new_tags:
-            print(f"\n{'EPC':<26} {'RSSI':<8} {'Antena':<8} {'Vezes':<8}")
-            print("-" * 60)
-            for tag in new_tags:
-                epc_display = decode_epc(tag["epc"])[:24]
-                antennas = ",".join(str(a) for a in tag["antennas"])
-                print(
-                    f"{epc_display:<26} {tag['avg_rssi']:<8} {antennas:<8} {tag['count']:<8}"
-                )
-            print(f"\nTotal: {len(new_tags)} tag(s) unica(s) detectada(s)")
-        elif tags:
-            print(f"\n{'EPC':<26} {'RSSI':<8} {'Antena':<8} {'Vezes':<8}")
-            print("-" * 60)
-            for tag in tags:
-                epc_display = decode_epc(tag["epc"])[:24]
-                antennas = ",".join(str(a) for a in tag["antennas"])
-                print(
-                    f"{epc_display:<26} {tag['avg_rssi']:<8} {antennas:<8} {tag['count']:<8}"
-                )
-            print(f"\nTotal: {len(tags)} tag(s) unica(s)")
-            print("Nenhuma tag NOVA detectada nesta sessao.")
-            print("Tags anteriores continuam no sistema.")
-        else:
-            print("\nNenhuma tag detectada.")
-            print("Verifique se as tags estao no campo do leitor.")
-            print("\nSe o leitor nao estiver conectado, reinicie o programa.")
-
-        input("\nPressione ENTER para voltar...")
 
     def list_scanned_tags(self):
         self.clear_screen()

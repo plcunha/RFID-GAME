@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 from sllurp.llrp import LLRPReaderClient, LLRPReaderConfig, LLRP_DEFAULT_PORT
 
@@ -10,74 +10,35 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def find_tx_power_index(tx_power_table: List[float], target_dbm: float) -> int:
-    """Find the closest power index in the reader's power table."""
-    best_idx = 0
-    best_diff = float("inf")
-    for i, val in enumerate(tx_power_table):
-        diff = abs(val - target_dbm)
-        if diff < best_diff:
-            best_diff = diff
-            best_idx = i
-    return best_idx
-
-
 class RFIDReader:
-    def __init__(
-        self, ip: str, port: int = LLRP_DEFAULT_PORT, tx_power_dbm: float = 30
-    ):
+    def __init__(self, ip: str, port: int = LLRP_DEFAULT_PORT):
         self.ip = ip
         self.port = port
-        self.tx_power_dbm = tx_power_dbm
         self.reader: Optional[LLRPReaderClient] = None
         self.connected = False
         self._callback: Optional[Callable] = None
 
     def connect(self) -> bool:
         try:
-            # Build base config
-            config_dict = {
-                "tag_content_selector": {
-                    "EnableROSpecID": False,
-                    "EnableSpecIndex": False,
-                    "EnableInventoryParameterSpecID": False,
-                    "EnableAntennaID": True,
-                    "EnableChannelIndex": False,
-                    "EnablePeakRSSI": True,
-                    "EnableFirstSeenTimestamp": False,
-                    "EnableLastSeenTimestamp": False,
-                    "EnableTagSeenCount": False,
-                    "EnableAccessSpecID": False,
-                },
-            }
-
-            # First, connect with default power to get power table from reader
-            temp_config = LLRPReaderConfig({**config_dict, "tx_power": {1: 0}})
-            self.reader = LLRPReaderClient(self.ip, self.port, temp_config)
+            config = LLRPReaderConfig(
+                {
+                    "tag_content_selector": {
+                        "EnableROSpecID": False,
+                        "EnableSpecIndex": False,
+                        "EnableInventoryParameterSpecID": False,
+                        "EnableAntennaID": True,
+                        "EnableChannelIndex": False,
+                        "EnablePeakRSSI": True,
+                        "EnableFirstSeenTimestamp": False,
+                        "EnableLastSeenTimestamp": False,
+                        "EnableTagSeenCount": False,
+                        "EnableAccessSpecID": False,
+                    }
+                }
+            )
+            self.reader = LLRPReaderClient(self.ip, self.port, config)
             self.reader.add_tag_report_callback(self._on_tag_report)
             self.reader.connect()
-
-            # Get power table from reader capabilities
-            power_table = getattr(self.reader, "tx_power_table", None)
-            if power_table:
-                power_index = find_tx_power_index(power_table, self.tx_power_dbm)
-                logger.info(
-                    f"Setting tx_power to {self.tx_power_dbm}dBm (index {power_index})"
-                )
-                # Disconnect and reconnect with correct power
-                self.reader.disconnect()
-                self.reader = None
-
-                # Reconnect with correct power setting
-                config = LLRPReaderConfig({**config_dict, "tx_power": {1: power_index}})
-                self.reader = LLRPReaderClient(self.ip, self.port, config)
-                self.reader.add_tag_report_callback(self._on_tag_report)
-                self.reader.connect()
-            else:
-                logger.warning(
-                    "Could not get power table from reader, using default power"
-                )
-
             self.connected = True
             logger.info(f"Connected to reader at {self.ip}:{self.port}")
             return True
@@ -87,11 +48,6 @@ class RFIDReader:
                 logger.error(
                     "Reader already in use by another client. "
                     "Close other programs or restart the reader."
-                )
-            elif "ROSpec" in error_msg or "already configured" in error_msg.lower():
-                logger.error(
-                    "Reader in inconsistent state. "
-                    "Restart the reader (power cycle) and try again."
                 )
             else:
                 logger.error(f"Failed to connect: {e}")
@@ -130,3 +86,11 @@ class RFIDReader:
 
     def is_alive(self) -> bool:
         return self.connected and self.reader is not None and self.reader.is_alive()
+
+    def start(self):
+        """Start the reader inventory (no-op, sllurp starts automatically)."""
+        pass
+
+    def stop(self):
+        """Stop the reader inventory (no-op)."""
+        pass
