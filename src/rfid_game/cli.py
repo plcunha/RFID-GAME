@@ -184,7 +184,7 @@ class RFIDGameCLI:
     def _connect_reader(self) -> bool:
         reader_ip = self.config.get("reader_ip", "192.168.89.25")
         print(f"\nConectando ao leitor em {reader_ip}...")
-        self.scanner = RFIDReader(reader_ip)
+        self.scanner = RFIDReader(reader_ip, tx_power_dbm=self.tx_power_dbm)
         if self.scanner.connect():
             self.scanner.set_callback(self.on_tag_detected)
             self.scanner.start()
@@ -250,6 +250,13 @@ class RFIDGameCLI:
     def connect_reader(self) -> bool:
         if self.scanner and self.scanner.connected:
             return True
+        return self._connect_reader()
+
+    def reconnect_with_power(self) -> bool:
+        """Disconnect and reconnect with current power setting."""
+        if self.scanner:
+            self.scanner.disconnect()
+            self.scanner = None
         return self._connect_reader()
 
     def disconnect_reader(self):
@@ -458,26 +465,53 @@ class RFIDGameCLI:
         choice = input("Escolha (curta/media/longa ou valor em dBm): ").strip().lower()
 
         if choice in DISTANCE_PRESETS:
-            self.tx_power_dbm = DISTANCE_PRESETS[choice]["dbm"]
+            new_power = DISTANCE_PRESETS[choice]["dbm"]
         elif choice:
             try:
                 val = float(choice)
-                if 10 <= val <= 31:
-                    self.tx_power_dbm = val
+                if 15 <= val <= 30:
+                    new_power = val
                 else:
-                    print("\nValor fora do range (10-31dBm). Usando 30dBm.")
-                    self.tx_power_dbm = 30
+                    print("\nValor fora do range (15-30dBm). Usando 30dBm.")
+                    new_power = 30
             except ValueError:
                 print("\nEntrada invalida. Distancia mantida.")
                 input("\nPressione ENTER para voltar...")
                 return
+        else:
+            print("\nDistancia mantida.")
+            input("\nPressione ENTER para voltar...")
+            return
 
+        # Check if power changed
+        if new_power == self.tx_power_dbm:
+            print(
+                f"\nDistancia ja configurada: {self.tx_power_dbm}dBm ({self._get_distance_name()})"
+            )
+            input("\nPressione ENTER para voltar...")
+            return
+
+        self.tx_power_dbm = new_power
         self.config["tx_power_dbm"] = self.tx_power_dbm
         save_config(self.config)
         print(
             f"\nDistancia configurada: {self.tx_power_dbm}dBm ({self._get_distance_name()})"
         )
-        print("Reinicie o programa para aplicar a nova potencia.")
+
+        # Offer to reconnect if reader is connected
+        if self.scanner and self.scanner.connected:
+            print("\nDeseja reconectar agora para aplicar a nova potencia? (s/N)")
+            choice = input("Reconectar? ").strip().lower()
+            if choice == "s":
+                print("\nReconectando com nova potencia...")
+                if self.reconnect_with_power():
+                    print("Reconectado com sucesso! Nova potencia aplicada.")
+                else:
+                    print("Falha ao reconectar. Reinicie o programa.")
+            else:
+                print("\nReinicie o programa para aplicar a nova potencia.")
+        else:
+            print("\nReinicie o programa para aplicar a nova potencia.")
 
         input("\nPressione ENTER para voltar...")
 
