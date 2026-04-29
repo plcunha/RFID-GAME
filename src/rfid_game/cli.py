@@ -1,623 +1,1 @@
-import logging
-import time
-import sys
-import os
-import json
-import threading
-from typing import Dict, List, Optional
-
-from .rfid_reader import RFIDReader
-from .keyboard_controller import KeyboardController
-from .game_logic import GameLogic
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
-
-SPECIAL_KEYS = [
-    "left",
-    "right",
-    "up",
-    "down",
-    "enter",
-    "tab",
-    "space",
-    "esc",
-    "backspace",
-    "delete",
-    "home",
-    "end",
-    "page_up",
-    "page_down",
-    "f1",
-    "f2",
-    "f3",
-    "f4",
-    "f5",
-    "f6",
-    "f7",
-    "f8",
-    "f9",
-    "f10",
-    "f11",
-    "f12",
-]
-
-
-def decode_epc(epc_hex: str) -> str:
-    try:
-        return bytes.fromhex(epc_hex).decode("ascii", errors="replace")
-    except (ValueError, UnicodeDecodeError):
-        return epc_hex[:24]
-
-
-DISTANCE_PRESETS = {
-    "curta": {"dbm": 15, "desc": "~0.5m (proximidade)"},
-    "media": {"dbm": 25, "desc": "~1-3m (media)"},
-    "longa": {"dbm": 30, "desc": "~3-10m (maxima)"},
-}
-
-
-def load_config() -> dict:
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as f:
-            config = json.load(f)
-            # Ensure all required keys exist
-            if "scanned_tags" not in config:
-                config["scanned_tags"] = {}
-            return config
-    return {
-        "keybinds": {},
-        "scanned_tags": {},
-        "reader_ip": "192.168.89.25",
-        "tx_power_dbm": 30,
-    }
-
-
-def save_config(config: dict):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=2)
-
-
-class TagStore:
-    """Stores scanned RFID tags with thread-safe access."""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._tags: Dict[str, dict] = {}
-
-    def clear(self):
-        with self._lock:
-            self._tags.clear()
-
-    def add_tag(self, epc: str, rssi: int, antenna: int):
-        with self._lock:
-            if epc not in self._tags:
-                self._tags[epc] = {
-                    "epc": epc,
-                    "first_seen": time.time(),
-                    "last_seen": time.time(),
-                    "count": 1,
-                    "avg_rssi": rssi,
-                    "total_rssi": rssi,
-                    "antennas": {antenna},
-                }
-            else:
-                tag = self._tags[epc]
-                tag["last_seen"] = time.time()
-                tag["count"] += 1
-                tag["total_rssi"] += rssi
-                tag["avg_rssi"] = tag["total_rssi"] // tag["count"]
-                tag["antennas"].add(antenna)
-
-    def get_all_tags(self) -> List[dict]:
-        with self._lock:
-            result = []
-            for tag in self._tags.values():
-                result.append(
-                    {
-                        "epc": tag["epc"],
-                        "first_seen": tag["first_seen"],
-                        "last_seen": tag["last_seen"],
-                        "count": tag["count"],
-                        "avg_rssi": tag["avg_rssi"],
-                        "antennas": sorted(tag["antennas"]),
-                    }
-                )
-            return sorted(result, key=lambda t: t["count"], reverse=True)
-
-    def get_tags_for_config(self) -> dict:
-        with self._lock:
-            return {
-                epc: {
-                    "first_seen": t["first_seen"],
-                    "last_seen": t["last_seen"],
-                    "count": t["count"],
-                    "avg_rssi": t["avg_rssi"],
-                    "antennas": sorted(t["antennas"]),
-                }
-                for epc, t in self._tags.items()
-            }
-
-    def load_tags_from_config(self, scanned_tags: dict):
-        """Load previously scanned tags from config."""
-        with self._lock:
-            for epc, data in scanned_tags.items():
-                self._tags[epc] = {
-                    "epc": epc,
-                    "first_seen": data.get("first_seen", time.time()),
-                    "last_seen": data.get("last_seen", time.time()),
-                    "count": data.get("count", 1),
-                    "avg_rssi": data.get("avg_rssi", -100),
-                    "total_rssi": data.get("avg_rssi", -100) * data.get("count", 1),
-                    "antennas": set(data.get("antennas", [0])),
-                }
-
-
-class RFIDGameCLI:
-    def __init__(self):
-        self.config = load_config()
-        self.keybinds: Dict[str, str] = self.config.get("keybinds", {})
-        self.tx_power_dbm: float = self.config.get("tx_power_dbm", 30)
-        self.tag_store = TagStore()
-        # Load previously scanned tags from config
-        scanned_tags = self.config.get("scanned_tags", {})
-        if scanned_tags:
-            self.tag_store.load_tags_from_config(scanned_tags)
-            print(f"Carregadas {len(scanned_tags)} tag(s) escaneada(s) anteriormente.")
-        self.scanner: Optional[RFIDReader] = None
-        self.keyboard = KeyboardController()
-        self.game_logic = GameLogic(cooldown_seconds=0.5)
-        self.running = False
-        self._game_mode = False
-        # Sync keybinds to game_logic
-        for epc, key in self.keybinds.items():
-            self.game_logic.register_tag(epc, key)
-        # Set callback for game_logic
-        self.game_logic.on_tag_detected(self._on_game_action)
-        self._connect_reader()
-
-    def _connect_reader(self) -> bool:
-        reader_ip = self.config.get("reader_ip", "192.168.89.25")
-        print(f"\nConectando ao leitor em {reader_ip}...")
-        self.scanner = RFIDReader(reader_ip, tx_power_dbm=self.tx_power_dbm)
-        if self.scanner.connect():
-            self.scanner.set_callback(self.on_tag_detected)
-            self.scanner.start()
-            print("Conectado com sucesso!")
-            return True
-        else:
-            print(
-                "\nAVISO: Nao foi possivel conectar ao leitor."
-                "\n  - Verifique se o leitor esta ligado"
-                "\n  - Verifique o IP configurado"
-                "\n  - Nao pode haver outro programa conectado ao leitor"
-                "\nVoce podera cadastrar keybinds manualmente e iniciar o jogo depois."
-            )
-            return False
-
-    def clear_screen(self):
-        os.system("cls" if os.name == "nt" else "clear")
-
-    def print_header(self, title: str):
-        print("=" * 60)
-        print(f"  RFID GAME - {title}")
-        print("=" * 60)
-
-    def print_menu(self):
-        self.clear_screen()
-        self.print_header("MENU PRINCIPAL")
-        reader_ip = self.config.get("reader_ip", "192.168.89.25")
-        dist_name = self._get_distance_name()
-        print(f"\n  Leitor: {reader_ip}")
-        print(f"  Distancia: {dist_name} ({self.tx_power_dbm}dBm)")
-        print(f"  Keybinds: {len(self.keybinds)}")
-        print(f"  Tags escaneadas: {len(self.tag_store.get_all_tags())}")
-        print()
-        print("  1. ESCANEAR TAGS")
-        print("  2. LISTAR TAGS ESCANEADAS")
-        print("  3. CADASTRAR KEYBIND")
-        print("  4. LISTAR KEYBINDS")
-        print("  5. REMOVER KEYBIND")
-        print("  6. CONFIGURAR IP DO LEITOR")
-        print("  7. CONFIGURAR DISTANCIA")
-        print("  8. LIMPAR TAGS ESCANEADAS")
-        print("  9. INICIAR JOGO")
-        print()
-        print("  0. SAIR")
-        print()
-
-    def _get_distance_name(self) -> str:
-        for name, preset in DISTANCE_PRESETS.items():
-            if preset["dbm"] == self.tx_power_dbm:
-                return name.capitalize()
-        return f"{self.tx_power_dbm}dBm"
-
-    def on_tag_detected(self, epc: str, rssi: int, antenna: int):
-        self.tag_store.add_tag(epc, rssi, antenna)
-        if self._game_mode:
-            # Use game_logic with cooldown
-            self.game_logic.trigger_action(epc)
-
-    def _on_game_action(self, epc: str, action: str):
-        """Callback from game_logic when a tag action is triggered."""
-        self.keyboard.press_key(action)
-
-    def connect_reader(self) -> bool:
-        if self.scanner and self.scanner.connected:
-            return True
-        return self._connect_reader()
-
-    def reconnect_with_power(self) -> bool:
-        """Disconnect and reconnect with current power setting."""
-        if self.scanner:
-            self.scanner.disconnect()
-            self.scanner = None
-        return self._connect_reader()
-
-    def disconnect_reader(self):
-        if self.scanner:
-            self.scanner.disconnect()
-            self.scanner = None
-
-    def scan_tags(self):
-        if not self.scanner or not self.scanner.connected:
-            if not self.connect_reader():
-                input("\nPressione ENTER para voltar...")
-                return
-
-        self.clear_screen()
-        self.print_header("ESCANEAR TAGS")
-        print("\nLendo tags... Pressione Ctrl+C para parar.\n")
-        print(f"{'EPC':<26} {'RSSI':<8} {'Antena':<8} {'Vezes':<8}")
-        print("-" * 60)
-
-        last_count = 0
-        try:
-            while True:
-                tags = self.tag_store.get_all_tags()
-                if len(tags) != last_count:
-                    self.clear_screen()
-                    self.print_header("ESCANEAR TAGS")
-                    print("\nLendo tags... Pressione Ctrl+C para parar.\n")
-                    print(f"{'EPC':<26} {'RSSI':<8} {'Antena':<8} {'Vezes':<8}")
-                    print("-" * 60)
-                    for tag in tags:
-                        epc_display = decode_epc(tag["epc"])[:24]
-                        antennas = ",".join(str(a) for a in tag["antennas"])
-                        print(
-                            f"{epc_display:<26} {tag['avg_rssi']:<8} {antennas:<8} {tag['count']:<8}"
-                        )
-                    print(f"\nTotal: {len(tags)} tag(s) unica(s)")
-                    last_count = len(tags)
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            pass
-
-    def list_scanned_tags(self):
-        self.clear_screen()
-        self.print_header("TAGS ESCANEADAS")
-
-        tags = self.tag_store.get_all_tags()
-        if not tags:
-            print("\nNenhuma tag escaneada ainda.")
-            print("Use a opcao 1 para escanear tags primeiro.")
-        else:
-            print(
-                f"\n{'EPC':<26} {'RSSI':<8} {'Antena':<8} {'Vezes':<8} {'Ultima Vezida':<15}"
-            )
-            print("-" * 70)
-            for tag in tags:
-                last = time.strftime("%H:%M:%S", time.localtime(tag["last_seen"]))
-                antennas = ",".join(str(a) for a in tag["antennas"])
-                epc_display = decode_epc(tag["epc"])[:24]
-                print(
-                    f"{epc_display:<26} {tag['avg_rssi']:<8} {antennas:<8} {tag['count']:<8} {last:<15}"
-                )
-
-            print(f"\nTotal: {len(tags)} tag(s) escaneada(s)")
-
-        input("\nPressione ENTER para voltar...")
-
-    def register_keybind(self):
-        if not self.scanner or not self.scanner.connected:
-            print("\nLeitor nao conectado. Cadastre o EPC manualmente.")
-
-        self.clear_screen()
-        self.print_header("CADASTRAR KEYBIND")
-        print("\nPasse a tag RFID que deseja cadastrar...")
-        print("Ou digite o EPC manualmente (Enter para cancelar).\n")
-
-        choice = input("EPC da tag (ou deixe vazio para escanear): ").strip().lower()
-
-        if choice == "":
-            if not self.scanner or not self.scanner.connected:
-                print("Leitor nao conectado. Digite o EPC manualmente.")
-                choice = input("EPC da tag: ").strip().lower()
-                if not choice:
-                    print("Cancelado.")
-                    input("Pressione ENTER para voltar...")
-                    return
-                epc = choice
-            else:
-                print("Aguardando leitura da tag... (10 segundos)")
-                time.sleep(10)
-                tags = self.tag_store.get_all_tags()
-                if tags:
-                    epc = tags[0]["epc"]
-                    print(f"Tag lida: {decode_epc(epc)}")
-                else:
-                    print("Nenhuma tag lida. Digite o EPC manualmente.")
-                    epc = input("EPC da tag: ").strip().lower()
-                    if not epc:
-                        print("Cancelado.")
-                        input("Pressione ENTER para voltar...")
-                        return
-        else:
-            epc = choice
-
-        print(f"\nKeybinds disponiveis:")
-        print(f"  Teclas normais: a-z, 0-9, simbolos")
-        print(f"  Teclas especiais: {', '.join(SPECIAL_KEYS)}")
-        key = input(f"\nQual tecla vincular a {decode_epc(epc)[:20]}? ").strip().lower()
-
-        if not key:
-            print("Cancelado.")
-            input("Pressione ENTER para voltar...")
-            return
-
-        self.keybinds[epc] = key
-        # Sync to game_logic
-        self.game_logic.register_tag(epc, key)
-        self.config["keybinds"] = self.keybinds
-        self.config["reader_ip"] = self.config.get("reader_ip", "192.168.89.25")
-        self.config["scanned_tags"] = self.tag_store.get_tags_for_config()
-        save_config(self.config)
-
-        print(f"\nKeybind cadastrado: {decode_epc(epc)[:20]} -> [{key}]")
-        input("\nPressione ENTER para voltar...")
-
-    def list_keybinds(self):
-        self.clear_screen()
-        self.print_header("KEYBINDS CADASTRADOS")
-
-        if not self.keybinds:
-            print("\nNenhum keybind cadastrado.")
-            print("Use a opcao 3 para cadastrar keybinds.")
-        else:
-            print(f"\n{'EPC':<26} {'KEYBIND':<12}")
-            print("-" * 40)
-            for epc, key in sorted(self.keybinds.items()):
-                epc_display = decode_epc(epc)[:24]
-                print(f"{epc_display:<26} {key:<12}")
-
-            print(f"\nTotal: {len(self.keybinds)} keybind(s)")
-
-        input("\nPressione ENTER para voltar...")
-
-    def remove_keybind(self):
-        if not self.keybinds:
-            print("\nNenhum keybind cadastrado.")
-            input("Pressione ENTER para voltar...")
-            return
-
-        self.clear_screen()
-        self.print_header("REMOVER KEYBIND")
-        print()
-
-        for i, (epc, key) in enumerate(self.keybinds.items(), 1):
-            epc_display = decode_epc(epc)[:24]
-            print(f"  {i}. {epc_display} -> [{key}]")
-
-        print()
-        choice = input("Numero do keybind para remover (0=cancelar): ").strip()
-
-        if choice == "0" or not choice:
-            return
-
-        try:
-            idx = int(choice) - 1
-            epc = list(self.keybinds.keys())[idx]
-            key = self.keybinds.pop(epc)
-            # Sync from game_logic
-            self.game_logic.unregister_tag(epc)
-            self.config["keybinds"] = self.keybinds
-            save_config(self.config)
-            print(f"\nKeybind removido: {decode_epc(epc)[:20]} -> [{key}]")
-        except (ValueError, IndexError):
-            print("\nSelecao invalida.")
-
-        input("\nPressione ENTER para voltar...")
-
-    def configure_ip(self):
-        self.clear_screen()
-        self.print_header("CONFIGURAR IP DO LEITOR")
-        current_ip = self.config.get("reader_ip", "192.168.89.25")
-        print(f"\nIP atual: {current_ip}")
-        new_ip = input("\nNovo IP (Enter para manter): ").strip()
-
-        if new_ip:
-            self.config["reader_ip"] = new_ip
-            save_config(self.config)
-            print(f"\nIP atualizado para: {new_ip}")
-        else:
-            print("\nIP mantido.")
-
-        input("\nPressione ENTER para voltar...")
-
-    def configure_distance(self):
-        self.clear_screen()
-        self.print_header("CONFIGURAR DISTANCIA DO LEITOR")
-        print(f"\nPotencia atual: {self.tx_power_dbm}dBm ({self._get_distance_name()})")
-        print("\nDistancias disponiveis:")
-        for name, preset in DISTANCE_PRESETS.items():
-            marker = " <-- atual" if preset["dbm"] == self.tx_power_dbm else ""
-            print(
-                f"  {name.capitalize()} - {preset['desc']} ({preset['dbm']}dBm){marker}"
-            )
-        print()
-        print("  Ou digite um valor personalizado (15-30dBm)")
-        print()
-        choice = input("Escolha (curta/media/longa ou valor em dBm): ").strip().lower()
-
-        if choice in DISTANCE_PRESETS:
-            new_power = DISTANCE_PRESETS[choice]["dbm"]
-        elif choice:
-            try:
-                val = float(choice)
-                if 15 <= val <= 30:
-                    new_power = val
-                else:
-                    print("\nValor fora do range (15-30dBm). Usando 30dBm.")
-                    new_power = 30
-            except ValueError:
-                print("\nEntrada invalida. Distancia mantida.")
-                input("\nPressione ENTER para voltar...")
-                return
-        else:
-            print("\nDistancia mantida.")
-            input("\nPressione ENTER para voltar...")
-            return
-
-        # Check if power changed
-        if new_power == self.tx_power_dbm:
-            print(
-                f"\nDistancia ja configurada: {self.tx_power_dbm}dBm ({self._get_distance_name()})"
-            )
-            input("\nPressione ENTER para voltar...")
-            return
-
-        self.tx_power_dbm = new_power
-        self.config["tx_power_dbm"] = self.tx_power_dbm
-        save_config(self.config)
-        print(
-            f"\nDistancia configurada: {self.tx_power_dbm}dBm ({self._get_distance_name()})"
-        )
-
-        # Offer to reconnect if reader is connected
-        if self.scanner and self.scanner.connected:
-            print("\nDeseja reconectar agora para aplicar a nova potencia? (s/N)")
-            choice = input("Reconectar? ").strip().lower()
-            if choice == "s":
-                print("\nReconectando com nova potencia...")
-                if self.reconnect_with_power():
-                    print("Reconectado com sucesso! Nova potencia aplicada.")
-                else:
-                    print("Falha ao reconectar. Reinicie o programa.")
-            else:
-                print("\nReinicie o programa para aplicar a nova potencia.")
-        else:
-            print("\nReinicie o programa para aplicar a nova potencia.")
-
-        input("\nPressione ENTER para voltar...")
-
-    def clear_tags(self):
-        self.clear_screen()
-        self.print_header("LIMPAR TAGS ESCANEADAS")
-        count = len(self.tag_store.get_all_tags())
-        if count == 0:
-            print("\nNenhuma tag para limpar.")
-        else:
-            confirm = (
-                input(f"\n{count} tag(s) encontradas. Confirmar limpeza? (s/N): ")
-                .strip()
-                .lower()
-            )
-            if confirm == "s":
-                self.tag_store.clear()
-                self.config["scanned_tags"] = {}
-                save_config(self.config)
-                print(f"\n{count} tag(s) removidas.")
-            else:
-                print("\nLimpeza cancelada.")
-        input("\nPressione ENTER para voltar...")
-
-    def start_game(self):
-        if not self.keybinds:
-            print(
-                "\nNenhum keybind cadastrado. Cadastre keybinds antes de iniciar o jogo."
-            )
-            input("Pressione ENTER para voltar...")
-            return
-
-        if not self.scanner or not self.scanner.connected:
-            print("\nLeitor nao conectado. Verifique a conexao e tente novamente.")
-            input("Pressione ENTER para voltar...")
-            return
-
-        self._game_mode = True
-        self.clear_screen()
-        self.print_header("MODO JOGO ATIVO")
-        print("\nJogo iniciado! Passe as tags RFID para enviar teclas.")
-        print("Pressione Ctrl+C para parar.\n")
-        print("Keybinds ativos:")
-        for epc, key in self.keybinds.items():
-            print(f"  {decode_epc(epc)[:24]} -> [{key}]")
-        print()
-
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self._game_mode = False
-            print("\nJogo encerrado. O leitor continua conectado.")
-
-    def run(self):
-        self.clear_screen()
-        print("Inicializando...")
-        time.sleep(0.5)
-
-        try:
-            while True:
-                self.print_menu()
-                choice = input("Opcao: ").strip()
-
-                if choice == "1":
-                    self.scan_tags()
-                elif choice == "2":
-                    self.list_scanned_tags()
-                elif choice == "3":
-                    self.register_keybind()
-                elif choice == "4":
-                    self.list_keybinds()
-                elif choice == "5":
-                    self.remove_keybind()
-                elif choice == "6":
-                    self.configure_ip()
-                elif choice == "7":
-                    self.configure_distance()
-                elif choice == "8":
-                    self.clear_tags()
-                elif choice == "9":
-                    self.start_game()
-                elif choice == "0":
-                    print("\nEncerrando...")
-                    break
-                else:
-                    print("\nOpcao invalida.")
-                    time.sleep(1)
-        finally:
-            print("\nSalvando configuracoes...")
-            self.config["keybinds"] = self.keybinds
-            self.config["scanned_tags"] = self.tag_store.get_tags_for_config()
-            save_config(self.config)
-            print("Configuracoes salvas.")
-            if self.scanner:
-                self.scanner.disconnect()
-                self.scanner = None
-                print("Leitor desconectado.")
-
-
-def main():
-    cli = RFIDGameCLI()
-    cli.run()
-
-
-if __name__ == "__main__":
-    main()
+import loggingimport timeimport sysimport osimport jsonimport threadingfrom typing import Dict, List, Optionalfrom .rfid_reader import RFIDReaderfrom .keyboard_controller import KeyboardControllerfrom .game_logic import GameLogiclogging.basicConfig(    level=logging.INFO,    format="%(asctime)s - %(levelname)s - %(message)s",)logger = logging.getLogger(__name__)CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")SPECIAL_KEYS = [    "left",    "right",    "up",    "down",    "enter",    "tab",    "space",    "esc",    "backspace",    "delete",    "home",    "end",    "page_up",    "page_down",    "f1",    "f2",    "f3",    "f4",    "f5",    "f6",    "f7",    "f8",    "f9",    "f10",    "f11",    "f12",]def decode_epc(epc_hex: str) -> str:    try:        decoded = bytes.fromhex(epc_hex).decode("ascii", errors="replace")        # Replace Unicode replacement character with '?' for Windows console compatibility        return decoded.replace("\ufffd", "?")    except (ValueError, UnicodeDecodeError):        return epc_hex[:24]DISTANCE_PRESETS = {    "curta": {"dbm": 15, "desc": "~0.5m (proximidade)"},    "media": {"dbm": 25, "desc": "~1-3m (media)"},    "longa": {"dbm": 30, "desc": "~3-10m (maxima)"},}def load_config() -> dict:    if os.path.exists(CONFIG_FILE):        with open(CONFIG_FILE, "r") as f:            config = json.load(f)            # Ensure all required keys exist            if "scanned_tags" not in config:                config["scanned_tags"] = {}            return config    return {        "keybinds": {},        "scanned_tags": {},        "reader_ip": "192.168.89.25",        "tx_power_dbm": 30,    }def save_config(config: dict):    with open(CONFIG_FILE, "w") as f:        json.dump(config, f, indent=2)class TagStore:    """Stores scanned RFID tags with thread-safe access."""    def __init__(self):        self._lock = threading.Lock()        self._tags: Dict[str, dict] = {}    def clear(self):        with self._lock:            self._tags.clear()    def add_tag(self, epc: str, rssi: int, antenna: int):        with self._lock:            if epc not in self._tags:                self._tags[epc] = {                    "epc": epc,                    "first_seen": time.time(),                    "last_seen": time.time(),                    "count": 1,                    "avg_rssi": rssi,                    "total_rssi": rssi,                    "antennas": {antenna},                }            else:                tag = self._tags[epc]                tag["last_seen"] = time.time()                tag["count"] += 1                tag["total_rssi"] += rssi                tag["avg_rssi"] = tag["total_rssi"] // tag["count"]                tag["antennas"].add(antenna)    def get_all_tags(self) -> List[dict]:        with self._lock:            result = []            for tag in self._tags.values():                result.append(                    {                        "epc": tag["epc"],                        "first_seen": tag["first_seen"],                        "last_seen": tag["last_seen"],                        "count": tag["count"],                        "avg_rssi": tag["avg_rssi"],                        "antennas": sorted(tag["antennas"]),                    }                )            return sorted(result, key=lambda t: t["count"], reverse=True)    def get_tags_for_config(self) -> dict:        with self._lock:            return {                epc: {                    "first_seen": t["first_seen"],                    "last_seen": t["last_seen"],                    "count": t["count"],                    "avg_rssi": t["avg_rssi"],                    "antennas": sorted(t["antennas"]),                }                for epc, t in self._tags.items()            }    def load_tags_from_config(self, scanned_tags: dict):        """Load previously scanned tags from config."""        with self._lock:            for epc, data in scanned_tags.items():                self._tags[epc] = {                    "epc": epc,                    "first_seen": data.get("first_seen", time.time()),                    "last_seen": data.get("last_seen", time.time()),                    "count": data.get("count", 1),                    "avg_rssi": data.get("avg_rssi", -100),                    "total_rssi": data.get("avg_rssi", -100) * data.get("count", 1),                    "antennas": set(data.get("antennas", [0])),                }class RFIDGameCLI:    def __init__(self):        self.config = load_config()        self.keybinds: Dict[str, str] = self.config.get("keybinds", {})        self.tx_power_dbm: float = self.config.get("tx_power_dbm", 30)        self.tag_store = TagStore()        # Load previously scanned tags from config        scanned_tags = self.config.get("scanned_tags", {})        if scanned_tags:            self.tag_store.load_tags_from_config(scanned_tags)            print(f"Carregadas {len(scanned_tags)} tag(s) escaneada(s) anteriormente.")        self.scanner: Optional[RFIDReader] = None        self.keyboard = KeyboardController()        self.game_logic = GameLogic(cooldown_seconds=0.5)        self.running = False        self._game_mode = False        # Sync keybinds to game_logic        for epc, key in self.keybinds.items():            self.game_logic.register_tag(epc, key)        # Set callback for game_logic        self.game_logic.on_tag_detected(self._on_game_action)        self._connect_reader()    def _connect_reader(self) -> bool:        reader_ip = self.config.get("reader_ip", "192.168.89.25")        print(f"\nConectando ao leitor em {reader_ip}...")        self.scanner = RFIDReader(reader_ip, tx_power_dbm=self.tx_power_dbm)        if self.scanner.connect():            self.scanner.set_callback(self.on_tag_detected)            self.scanner.start()            print("Conectado com sucesso!")            return True        else:            print(                "\nAVISO: Nao foi possivel conectar ao leitor."                "\n  - Verifique se o leitor esta ligado"                "\n  - Verifique o IP configurado"                "\n  - Nao pode haver outro programa conectado ao leitor"                "\nVoce podera cadastrar keybinds manualmente e iniciar o jogo depois."            )            return False    def clear_screen(self):        os.system("cls" if os.name == "nt" else "clear")    def print_header(self, title: str):        print("=" * 60)        print(f"  RFID GAME - {title}")        print("=" * 60)    def print_menu(self):        self.clear_screen()        self.print_header("MENU PRINCIPAL")        reader_ip = self.config.get("reader_ip", "192.168.89.25")        dist_name = self._get_distance_name()        print(f"\n  Leitor: {reader_ip}")        print(f"  Distancia: {dist_name} ({self.tx_power_dbm}dBm)")        print(f"  Keybinds: {len(self.keybinds)}")        print(f"  Tags escaneadas: {len(self.tag_store.get_all_tags())}")        print()        print("  1. ESCANEAR TAGS")        print("  2. LISTAR TAGS ESCANEADAS")        print("  3. CADASTRAR KEYBIND")        print("  4. LISTAR KEYBINDS")        print("  5. REMOVER KEYBIND")        print("  6. CONFIGURAR IP DO LEITOR")        print("  7. CONFIGURAR DISTANCIA")        print("  8. LIMPAR TAGS ESCANEADAS")        print("  9. INICIAR JOGO")        print()        print("  0. SAIR")        print()    def _get_distance_name(self) -> str:        for name, preset in DISTANCE_PRESETS.items():            if preset["dbm"] == self.tx_power_dbm:                return name.capitalize()        return f"{self.tx_power_dbm}dBm"    def on_tag_detected(self, epc: str, rssi: int, antenna: int):        self.tag_store.add_tag(epc, rssi, antenna)        if self._game_mode:            # Use game_logic with cooldown            self.game_logic.trigger_action(epc)    def _on_game_action(self, epc: str, action: str):        """Callback from game_logic when a tag action is triggered."""        self.keyboard.press_key(action)    def connect_reader(self) -> bool:        if self.scanner and self.scanner.connected:            return True        return self._connect_reader()    def reconnect_with_power(self) -> bool:        """Disconnect and reconnect with current power setting."""        if self.scanner:            self.scanner.disconnect()            self.scanner = None        return self._connect_reader()    def disconnect_reader(self):        if self.scanner:            self.scanner.disconnect()            self.scanner = None    def scan_tags(self):        if not self.scanner or not self.scanner.connected:            if not self.connect_reader():                input("\nPressione ENTER para voltar...")                return        self.clear_screen()        self.print_header("ESCANEAR TAGS")        print("\nLendo tags... Pressione Ctrl+C para parar.\n")        print(f"{'EPC':<26} {'RSSI':<8} {'Antena':<8} {'Vezes':<8}")        print("-" * 60)        last_count = 0        try:            while True:                tags = self.tag_store.get_all_tags()                if len(tags) != last_count:                    self.clear_screen()                    self.print_header("ESCANEAR TAGS")                    print("\nLendo tags... Pressione Ctrl+C para parar.\n")                    print(f"{'EPC':<26} {'RSSI':<8} {'Antena':<8} {'Vezes':<8}")                    print("-" * 60)                    for tag in tags:                        epc_display = decode_epc(tag["epc"])[:24]                        antennas = ",".join(str(a) for a in tag["antennas"])                        print(                            f"{epc_display:<26} {tag['avg_rssi']:<8} {antennas:<8} {tag['count']:<8}"                        )                    print(f"\nTotal: {len(tags)} tag(s) unica(s)")                    last_count = len(tags)                time.sleep(0.5)        except KeyboardInterrupt:            pass    def list_scanned_tags(self):        self.clear_screen()        self.print_header("TAGS ESCANEADAS")        tags = self.tag_store.get_all_tags()        if not tags:            print("\nNenhuma tag escaneada ainda.")            print("Use a opcao 1 para escanear tags primeiro.")        else:            print(                f"\n{'EPC':<26} {'RSSI':<8} {'Antena':<8} {'Vezes':<8} {'Ultima Vezida':<15}"            )            print("-" * 70)            for tag in tags:                last = time.strftime("%H:%M:%S", time.localtime(tag["last_seen"]))                antennas = ",".join(str(a) for a in tag["antennas"])                epc_display = decode_epc(tag["epc"])[:24]                print(                    f"{epc_display:<26} {tag['avg_rssi']:<8} {antennas:<8} {tag['count']:<8} {last:<15}"                )            print(f"\nTotal: {len(tags)} tag(s) escaneada(s)")        input("\nPressione ENTER para voltar...")    def register_keybind(self):        if not self.scanner or not self.scanner.connected:            print("\nLeitor nao conectado. Cadastre o EPC manualmente.")        self.clear_screen()        self.print_header("CADASTRAR KEYBIND")        print("\nPasse a tag RFID que deseja cadastrar...")        print("Ou digite o EPC manualmente (Enter para cancelar).\n")        choice = input("EPC da tag (ou deixe vazio para escanear): ").strip().lower()        if choice == "":            if not self.scanner or not self.scanner.connected:                print("Leitor nao conectado. Digite o EPC manualmente.")                choice = input("EPC da tag: ").strip().lower()                if not choice:                    print("Cancelado.")                    input("Pressione ENTER para voltar...")                    return                epc = choice            else:                print("Aguardando leitura da tag... (10 segundos)")                time.sleep(10)                tags = self.tag_store.get_all_tags()                if tags:                    epc = tags[0]["epc"]                    print(f"Tag lida: {decode_epc(epc)}")                else:                    print("Nenhuma tag lida. Digite o EPC manualmente.")                    epc = input("EPC da tag: ").strip().lower()                    if not epc:                        print("Cancelado.")                        input("Pressione ENTER para voltar...")                        return        else:            epc = choice        print(f"\nKeybinds disponiveis:")        print(f"  Teclas normais: a-z, 0-9, simbolos")        print(f"  Teclas especiais: {', '.join(SPECIAL_KEYS)}")        key = input(f"\nQual tecla vincular a {decode_epc(epc)[:20]}? ").strip().lower()        if not key:            print("Cancelado.")            input("Pressione ENTER para voltar...")            return        self.keybinds[epc] = key        # Sync to game_logic        self.game_logic.register_tag(epc, key)        self.config["keybinds"] = self.keybinds        self.config["reader_ip"] = self.config.get("reader_ip", "192.168.89.25")        self.config["scanned_tags"] = self.tag_store.get_tags_for_config()        save_config(self.config)        print(f"\nKeybind cadastrado: {decode_epc(epc)[:20]} -> [{key}]")        input("\nPressione ENTER para voltar...")    def list_keybinds(self):        self.clear_screen()        self.print_header("KEYBINDS CADASTRADOS")        if not self.keybinds:            print("\nNenhum keybind cadastrado.")            print("Use a opcao 3 para cadastrar keybinds.")        else:            print(f"\n{'EPC':<26} {'KEYBIND':<12}")            print("-" * 40)            for epc, key in sorted(self.keybinds.items()):                epc_display = decode_epc(epc)[:24]                print(f"{epc_display:<26} {key:<12}")            print(f"\nTotal: {len(self.keybinds)} keybind(s)")        input("\nPressione ENTER para voltar...")    def remove_keybind(self):        if not self.keybinds:            print("\nNenhum keybind cadastrado.")            input("Pressione ENTER para voltar...")            return        self.clear_screen()        self.print_header("REMOVER KEYBIND")        print()        for i, (epc, key) in enumerate(self.keybinds.items(), 1):            epc_display = decode_epc(epc)[:24]            print(f"  {i}. {epc_display} -> [{key}]")        print()        choice = input("Numero do keybind para remover (0=cancelar): ").strip()        if choice == "0" or not choice:            return        try:            idx = int(choice) - 1            epc = list(self.keybinds.keys())[idx]            key = self.keybinds.pop(epc)            # Sync from game_logic            self.game_logic.unregister_tag(epc)            self.config["keybinds"] = self.keybinds            save_config(self.config)            print(f"\nKeybind removido: {decode_epc(epc)[:20]} -> [{key}]")        except (ValueError, IndexError):            print("\nSelecao invalida.")        input("\nPressione ENTER para voltar...")    def configure_ip(self):        self.clear_screen()        self.print_header("CONFIGURAR IP DO LEITOR")        current_ip = self.config.get("reader_ip", "192.168.89.25")        print(f"\nIP atual: {current_ip}")        new_ip = input("\nNovo IP (Enter para manter): ").strip()        if new_ip:            self.config["reader_ip"] = new_ip            save_config(self.config)            print(f"\nIP atualizado para: {new_ip}")        else:            print("\nIP mantido.")        input("\nPressione ENTER para voltar...")    def configure_distance(self):        self.clear_screen()        self.print_header("CONFIGURAR DISTANCIA DO LEITOR")        print(f"\nPotencia atual: {self.tx_power_dbm}dBm ({self._get_distance_name()})")        print("\nDistancias disponiveis:")        for name, preset in DISTANCE_PRESETS.items():            marker = " <-- atual" if preset["dbm"] == self.tx_power_dbm else ""            print(                f"  {name.capitalize()} - {preset['desc']} ({preset['dbm']}dBm){marker}"            )        print()        print("  Ou digite um valor personalizado (15-30dBm)")        print()        choice = input("Escolha (curta/media/longa ou valor em dBm): ").strip().lower()        if choice in DISTANCE_PRESETS:            new_power = DISTANCE_PRESETS[choice]["dbm"]        elif choice:            try:                val = float(choice)                if 15 <= val <= 30:                    new_power = val                else:                    print("\nValor fora do range (15-30dBm). Usando 30dBm.")                    new_power = 30            except ValueError:                print("\nEntrada invalida. Distancia mantida.")                input("\nPressione ENTER para voltar...")                return        else:            print("\nDistancia mantida.")            input("\nPressione ENTER para voltar...")            return        # Check if power changed        if new_power == self.tx_power_dbm:            print(                f"\nDistancia ja configurada: {self.tx_power_dbm}dBm ({self._get_distance_name()})"            )            input("\nPressione ENTER para voltar...")            return        self.tx_power_dbm = new_power        self.config["tx_power_dbm"] = self.tx_power_dbm        save_config(self.config)        print(            f"\nDistancia configurada: {self.tx_power_dbm}dBm ({self._get_distance_name()})"        )        # Offer to reconnect if reader is connected        if self.scanner and self.scanner.connected:            print("\nDeseja reconectar agora para aplicar a nova potencia? (s/N)")            choice = input("Reconectar? ").strip().lower()            if choice == "s":                print("\nReconectando com nova potencia...")                if self.reconnect_with_power():                    print("Reconectado com sucesso! Nova potencia aplicada.")                else:                    print("Falha ao reconectar. Reinicie o programa.")            else:                print("\nReinicie o programa para aplicar a nova potencia.")        else:            print("\nReinicie o programa para aplicar a nova potencia.")        input("\nPressione ENTER para voltar...")    def clear_tags(self):        self.clear_screen()        self.print_header("LIMPAR TAGS ESCANEADAS")        count = len(self.tag_store.get_all_tags())        if count == 0:            print("\nNenhuma tag para limpar.")        else:            confirm = (                input(f"\n{count} tag(s) encontradas. Confirmar limpeza? (s/N): ")                .strip()                .lower()            )            if confirm == "s":                self.tag_store.clear()                self.config["scanned_tags"] = {}                save_config(self.config)                print(f"\n{count} tag(s) removidas.")            else:                print("\nLimpeza cancelada.")        input("\nPressione ENTER para voltar...")    def start_game(self):        if not self.keybinds:            print(                "\nNenhum keybind cadastrado. Cadastre keybinds antes de iniciar o jogo."            )            input("Pressione ENTER para voltar...")            return        if not self.scanner or not self.scanner.connected:            print("\nLeitor nao conectado. Verifique a conexao e tente novamente.")            input("Pressione ENTER para voltar...")            return        self._game_mode = True        self.clear_screen()        self.print_header("MODO JOGO ATIVO")        print("\nJogo iniciado! Passe as tags RFID para enviar teclas.")        print("Pressione Ctrl+C para parar.\n")        print("Keybinds ativos:")        for epc, key in self.keybinds.items():            print(f"  {decode_epc(epc)[:24]} -> [{key}]")        print()        try:            while True:                time.sleep(1)        except KeyboardInterrupt:            pass        finally:            self._game_mode = False            print("\nJogo encerrado. O leitor continua conectado.")    def run(self):        self.clear_screen()        print("Inicializando...")        time.sleep(0.5)        try:            while True:                self.print_menu()                choice = input("Opcao: ").strip()                if choice == "1":                    self.scan_tags()                elif choice == "2":                    self.list_scanned_tags()                elif choice == "3":                    self.register_keybind()                elif choice == "4":                    self.list_keybinds()                elif choice == "5":                    self.remove_keybind()                elif choice == "6":                    self.configure_ip()                elif choice == "7":                    self.configure_distance()                elif choice == "8":                    self.clear_tags()                elif choice == "9":                    self.start_game()                elif choice == "0":                    print("\nEncerrando...")                    break                else:                    print("\nOpcao invalida.")                    time.sleep(1)        finally:            print("\nSalvando configuracoes...")            self.config["keybinds"] = self.keybinds            self.config["scanned_tags"] = self.tag_store.get_tags_for_config()            save_config(self.config)            print("Configuracoes salvas.")            if self.scanner:                self.scanner.disconnect()                self.scanner = None                print("Leitor desconectado.")def main():    cli = RFIDGameCLI()    cli.run()if __name__ == "__main__":    main()

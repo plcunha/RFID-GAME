@@ -12,20 +12,21 @@ logger = logging.getLogger(__name__)
 
 class RFIDReader:
     def __init__(
-        self, ip: str, port: int = LLRP_DEFAULT_PORT, tx_power_dbm: float = 30
+        self,
+        ip: str,
+        port: int = LLRP_DEFAULT_PORT,
+        tx_power_dbm: float = 30,
+        callback: Optional[Callable] = None,
     ):
         self.ip = ip
         self.port = port
         self.tx_power_dbm = tx_power_dbm
         self.reader: Optional[LLRPReaderClient] = None
         self.connected = False
-        self._callback: Optional[Callable] = None
+        self._callback: Optional[Callable] = callback
 
     def _build_config(self):
-        """Build LLRPReaderConfig with tx_power setting."""
-        # Use index = dBm (most readers map 1:1, e.g., index 30 = 30 dBm)
-        # Range is typically 0-87, but we use 15-30 for safety
-        tx_power_index = max(15, min(30, int(self.tx_power_dbm)))
+        """Build LLRPReaderConfig."""
         config_dict = {
             "tag_content_selector": {
                 "EnableROSpecID": False,
@@ -39,9 +40,18 @@ class RFIDReader:
                 "EnableTagSeenCount": False,
                 "EnableAccessSpecID": False,
             },
-            "tx_power": {1: tx_power_index},
+            # Configure immediate tag reporting (disable batching)
+            # report_every_n_tags=1: report after each tag
+            # report_timeout_ms=0: no timeout delay
+            "report_every_n_tags": 1,
+            "report_timeout_ms": 0,
         }
-        return LLRPReaderConfig(config_dict)
+        config = LLRPReaderConfig(config_dict)
+        # sllurp v3.0.5 expects tx_power as dict {antenna_id: power_index}
+        # Set power index 30 for antenna 1 (typical max power for Impinj readers)
+        # Power index 30 typically corresponds to ~30 dBm (depending on reader model)
+        config.tx_power = {1: 30}
+        return config
 
     def connect(self) -> bool:
         try:
@@ -50,10 +60,7 @@ class RFIDReader:
             self.reader.add_tag_report_callback(self._on_tag_report)
             self.reader.connect()
             self.connected = True
-            tx_power_index = max(15, min(30, int(self.tx_power_dbm)))
-            logger.info(
-                f"Connected to reader at {self.ip}:{self.port} (power: {self.tx_power_dbm}dBm = index {tx_power_index})"
-            )
+            logger.info(f"Connected to reader at {self.ip}:{self.port}")
             return True
 
         except Exception as e:
